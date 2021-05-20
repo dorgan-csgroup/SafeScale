@@ -2072,8 +2072,13 @@ func (instance *Cluster) taskDeleteNodeOnFailure(task concurrency.Task, params c
 	xerr = rh.Delete(context.Background())
 	xerr = debug.InjectPlannedFail(xerr)
 	if xerr != nil {
-		logrus.Errorf(prefix + fmt.Sprintf("failed to delete Host '%s'", hostName))
-		return nil, xerr
+		switch xerr.(type) {
+		case *fail.ErrNotFound:
+			logrus.Debugf("Node %s not found, deletion considered success", hostName)
+			return nil, nil
+		default:
+			return nil, xerr
+		}
 	}
 
 	logrus.Debugf(prefix + fmt.Sprintf("successfully deleted Host '%s'", hostName))
@@ -2129,7 +2134,13 @@ func (instance *Cluster) taskDeleteNode(task concurrency.Task, params concurrenc
 	xerr = instance.deleteNode(task.GetContext(), p.node, p.master)
 	xerr = debug.InjectPlannedFail(xerr)
 	if xerr != nil {
-		return nil, xerr
+		switch xerr.(type) {
+		case *fail.ErrNotFound:
+			logrus.Debugf("Node %s not found, deletion considered success", nodeName)
+			return nil, nil
+		default:
+			return nil, xerr
+		}
 	}
 
 	logrus.Debugf("Successfully deleted Node '%s'", nodeName)
@@ -2176,8 +2187,13 @@ func (instance *Cluster) taskDeleteMaster(task concurrency.Task, params concurre
 	xerr = instance.deleteMaster(task.GetContext(), host)
 	xerr = debug.InjectPlannedFail(xerr)
 	if xerr != nil {
-		logrus.Errorf("Failed to delete Master '%s'", p.node.Name)
-		return nil, xerr
+		switch xerr.(type) {
+		case *fail.ErrNotFound:
+			logrus.Debugf("Master %s not found, deletion considered success", p.node.Name)
+			return nil, nil
+		default:
+			return nil, xerr
+		}
 	}
 
 	logrus.Debugf("Successfully deleted Master '%s'", p.node.Name)
@@ -2209,8 +2225,13 @@ func (instance *Cluster) taskDeleteHostOnFailure(task concurrency.Task, params c
 	xerr = hostInstance.Delete(context.Background())
 	xerr = debug.InjectPlannedFail(xerr)
 	if xerr != nil {
-		logrus.Errorf(prefix + fmt.Sprintf("failed to delete Host '%s'", hostName))
-		return nil, xerr
+		switch xerr.(type) {
+		case *fail.ErrNotFound:
+			logrus.Debugf("Host %s not found, deletion considered success", hostName)
+			return nil, nil
+		default:
+			return nil, xerr
+		}
 	}
 
 	logrus.Debugf(prefix + fmt.Sprintf("successfully deleted Host '%s'", hostName))

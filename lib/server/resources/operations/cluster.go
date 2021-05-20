@@ -1217,19 +1217,14 @@ func (instance *Cluster) AddNodes(ctx context.Context, count uint, def abstract.
 		return nil, fail.InvalidParameterError("count", "must be an int > 0")
 	}
 
-	tgo, xerr := concurrency.TaskFromContext(ctx)
+	task, xerr := concurrency.TaskFromContext(ctx)
 	xerr = debug.InjectPlannedFail(xerr)
 	if xerr != nil {
 		return nil, xerr
 	}
 
-	if tgo.Aborted() {
+	if task.Aborted() {
 		return nil, fail.AbortedError(nil, "aborted")
-	}
-
-	task, err := concurrency.NewTaskGroupWithParent(tgo)
-	if err != nil {
-		return nil, err
 	}
 
 	tracer := debug.NewTracer(task, tracing.ShouldTrace("resources.cluster"), "(%d)", count)
@@ -1282,7 +1277,41 @@ func (instance *Cluster) AddNodes(ctx context.Context, count uint, def abstract.
 
 	timeout := temporal.GetExecutionTimeout() + time.Duration(count)*time.Minute
 
-	var newHosts []resources.Host
+	var subtasks []concurrency.Task
+	for i := uint(0); i < count; i++ {
+		if task.Aborted() {
+			return nil, fail.AbortedError(nil, "aborted")
+		}
+
+		subtask, xerr := task.StartInSubtask(instance.taskCreateNode, taskCreateNodeParameters{
+			index:         i + 1,
+			nodeDef:       nodeDef,
+			timeout:       timeout,
+			keepOnFailure: false,
+		})
+		xerr = debug.InjectPlannedFail(xerr)
+		if xerr != nil {
+			return nil, xerr
+		}
+
+		subtasks = append(subtasks, subtask)
+	}
+	for _, s := range subtasks {
+		res, err := s.Wait()
+		err = debug.InjectPlannedFail(err)
+		if err != nil {
+			errors = append(errors, err.Error())
+		} else {
+			if res != nil {
+				hosts = append(hosts, res.(resources.Host))
+			} else {
+				errors = append(errors, "unknown error creating a node") // FIXME: This is a Task issue
+			}
+		}
+	}
+
+	// Starting from here, delete nodes if exiting with error
+	newHosts := hosts
 	defer func() {
 		if xerr != nil && len(newHosts) > 0 {
 			logrus.Debugf("Cleaning up on failure, deleting Nodes...")
@@ -1294,29 +1323,10 @@ func (instance *Cluster) AddNodes(ctx context.Context, count uint, def abstract.
 			}
 		}
 	}()
-	for i := uint(0); i < count; i++ {
-		_, xerr := task.StartInSubtask(instance.taskCreateNode, taskCreateNodeParameters{
-			index:         i + 1,
-			nodeDef:       nodeDef,
-			timeout:       timeout,
-			keepOnFailure: false,
-		})
-		xerr = debug.InjectPlannedFail(xerr)
-		if xerr != nil {
-			return nil, xerr
-		}
-	}
-	res, err := task.WaitGroup()
-	if res != nil {
-		for _, v := range res {
-			if aHost, ok := v.(resources.Host); ok {
-				newHosts = append(newHosts, aHost)
-			}
-		}
-	}
-	err = debug.InjectPlannedFail(err)
-	if err != nil {
-		return nil, fail.NewErrorWithCause(err, "errors occurred on %s node%s addition", nodeTypeStr, strprocess.Plural(uint(len(errors))))
+
+	if len(errors) > 0 {
+		xerr = fail.NewError("errors occurred on %s node%s addition: %s", nodeTypeStr, strprocess.Plural(uint(len(errors))), strings.Join(errors, "\n"))
+		return nil, xerr
 	}
 
 	// Now configure new nodes
@@ -2790,37 +2800,52 @@ func realizeTemplate(box *rice.Box, tmplName string, data map[string]interface{}
 }
 
 // configureNodesFromList configures nodes from a list
-func (instance *Cluster) configureNodesFromList(tgo concurrency.Task, hosts []resources.Host) (xerr fail.Error) {
-	tracer := debug.NewTracer(tgo, tracing.ShouldTrace("resources.cluster")).Entering()
+func (instance *Cluster) configureNodesFromList(task concurrency.Task, hosts []resources.Host) (xerr fail.Error) {
+	tracer := debug.NewTracer(task, tracing.ShouldTrace("resources.cluster")).Entering()
 	defer tracer.Exiting()
 
-	if tgo.Aborted() {
+	if task.Aborted() {
 		return fail.AbortedError(nil, "aborted")
 	}
 
-	task, err := concurrency.NewTaskGroupWithParent(tgo)
-	if err != nil {
-		return err
-	}
+	var (
+		hostID string
+		errs   []error
+	)
 
+	var subtasks []concurrency.Task
 	length := len(hosts)
 	for i := 0; i < length; i++ {
-		_, ierr := task.StartInSubtask(instance.taskConfigureNode, taskConfigureNodeParameters{
+		if task.Aborted() {
+			return fail.AbortedError(nil, "aborted")
+		}
+
+		subtask, err := task.StartInSubtask(instance.taskConfigureNode, taskConfigureNodeParameters{
 			Index: uint(i + 1),
 			Host:  hosts[i],
 		})
-		ierr = debug.InjectPlannedFail(ierr)
-		if ierr != nil {
-			_ = task.Abort()
+		err = debug.InjectPlannedFail(err)
+		if err != nil {
+			xerr = err
 			break
 		}
+		subtasks = append(subtasks, subtask)
 	}
-	_, err = task.WaitGroup()
-	err = debug.InjectPlannedFail(err)
-	if err != nil {
-		return err
+	// Deals with the metadata read failure
+	xerr = debug.InjectPlannedFail(xerr)
+	if xerr != nil {
+		errs = append(errs, fail.Wrap(xerr, "failed to get metadata of Host '%s'", hostID))
 	}
 
+	for _, s := range subtasks {
+		_, state := s.Wait()
+		if state != nil {
+			errs = append(errs, state)
+		}
+	}
+	if len(errs) > 0 {
+		return fail.NewErrorList(errs)
+	}
 	return nil
 }
 
